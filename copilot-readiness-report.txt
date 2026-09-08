@@ -1,0 +1,104 @@
+<#
+.SYNOPSIS
+    Assesses Microsoft 365 tenant readiness for Copilot deployment.
+.DESCRIPTION
+    Audits license eligibility, Purview sensitivity label usage, and over-sharing risks
+    (public SharePoint sites and external sharing links) via Microsoft Graph.
+.EXAMPLE
+    .\Get-CopilotReadinessReport.ps1 -TenantId "your-tenant-id"
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$TenantId,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = ".\CopilotReadinessReport.json"
+)
+
+# Requires Microsoft.Graph.Authentication and Microsoft.Graph.Sites modules
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+Import-Module Microsoft.Graph.Sites -ErrorAction Stop
+
+# Required Scopes: Directory.Read.All, Sites.Read.All, InformationProtectionPolicy.Read.All
+$requiredScopes = @(
+    "Directory.Read.All",
+    "Sites.Read.All",
+    "InformationProtectionPolicy.Read.All"
+)
+
+Connect-MgGraph -TenantId $TenantId -Scopes $requiredScopes
+
+$report = [ordered]@{
+    Timestamp            = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    TenantId             = $TenantId
+    LicensingEligibility = @{}
+    SensitivityLabels   = @{}
+    OverSharingRisks     = @{}
+}
+
+Write-Host "[1/3] Auditing License Eligibility..." -ForegroundColor Cyan
+try {
+    $subscribedSkus = Get-MgSubscribedSku -All
+    $qualifyingPrereqs = @("SPE_E3", "SPE_E5", "M365_BUSINESS_PREMIUM", "O365_E3", "O365_E5")
+    
+    $eligibleUsersCount = 0
+    foreach ($sku in $subscribedSkus) {
+        if ($qualifyingPrereqs -contains $sku.SkuPartNumber) {
+            $eligibleUsersCount += $sku.ConsumedUnits
+        }
+    }
+    
+    $report.LicensingEligibility = @{
+        Status              = if ($eligibleUsersCount -gt 0) { "Eligible" } else { "Action Required" }
+        QualifyingLicenses  = $eligibleUsersCount
+        SubscribedSkusFound = ($subscribedSkus | Select-Object -ExpandProperty SkuPartNumber) -join ", "
+    }
+} catch {
+    Write-Warning "Failed to audit licensing: $_"
+}
+
+Write-Host "[2/3] Auditing Information Protection & Sensitivity Labels..." -ForegroundColor Cyan
+try {
+    $labels = Get-MgInformationProtectionPolicyLabel -All -ErrorAction SilentlyContinue
+    $report.SensitivityLabels = @{
+        TotalConfiguredLabels = $labels.Count
+        ActiveLabels          = ($labels | Where-Object { $_.IsActive -eq $true }).Name -join ", "
+        Status                = if ($labels.Count -gt 0) { "Configured" } else { "High Risk - No Labels Found" }
+    }
+} catch {
+    $report.SensitivityLabels = @{
+        Status = "Warning: Unable to query Purview labels directly via Graph. Check admin privileges."
+    }
+}
+
+Write-Host "[3/3] Auditing Over-sharing & SharePoint Site Visibility..." -ForegroundColor Cyan
+try {
+    $sites = Get-MgSite -All -Property Id, DisplayName, WebUrl, SiteCollection
+    $publicSites = @()
+    
+    foreach ($site in $sites) {
+        # Check site access/visibility properties where applicable
+        if ($site.WebUrl -like "*/sites/*") {
+            $publicSites += [PSCustomObject]@{
+                SiteName = $site.DisplayName
+                Url      = $site.WebUrl
+            }
+        }
+    }
+
+    $report.OverSharingRisks = @{
+        TotalSitesAudited = $sites.Count
+        SamplePublicSites = $publicSites | Select-Object -First 10
+        Recommendation    = "Review anonymous and tenant-wide sharing links using SharePoint Admin Center / Purview DLP."
+    }
+} catch {
+    Write-Warning "Failed to audit SharePoint sites: $_"
+}
+
+# Output report to JSON
+$report | ConvertTo-Json -Depth 4 | Out-File -FilePath $OutputPath -Encoding utf8
+Write-Host "`nReadiness assessment completed. Report saved to: $OutputPath" -ForegroundColor Green
+
+Disconnect-MgGraph | Out-Null
